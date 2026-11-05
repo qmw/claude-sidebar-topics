@@ -1,0 +1,5 @@
+{
+  "name": "claude-sidebar-topics",
+  "owner": { "name": "qmw" },
+  "plugins": [{ "name": "sidebar-topics", "source": "./" }]
+}

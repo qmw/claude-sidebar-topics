@@ -1,0 +1,8 @@
+{
+  "name": "sidebar-topics",
+  "version": "0.1.0",
+  "description": "A sidebar pane listing every Claude Code session waiting for your input or go-ahead; pick one, read where it stopped, reply into it.",
+  "author": { "name": "Piotr Sobolewski" },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
