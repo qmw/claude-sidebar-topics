@@ -1,23 +1,29 @@
 # sidebar-topics
 
-A Claude Code mod that keeps a **Topics** sidebar beside the chat. It lists
-every Claude Code session you have running on this machine, with the ones
-that are waiting for you at the top:
+A Claude Code mod that keeps a **Topics** pane beside the chat, listing the
+points in this conversation on which Claude is waiting for you:
 
-- `?` the session asks you a question (an AskUserQuestion dialog is open)
-- `!` the session waits for your go (a permission prompt)
-- `•` the session finished its turn and waits for your next prompt
-- `~` the session is working
+- `?` a question Claude asked you
+- `!` a go-ahead Claude wants before doing something
+- `•` information or a decision Claude needs
 
-Click a topic to see what that session last said or asked, then type a reply
-and press Enter. A reply to the session you are in goes to its prompt; a reply
-to another session is delivered to it as a message, and it answers there. The
-detail card also offers to copy a `claude --resume <id>` line for that session.
+Click a topic to see the ask in Claude's words, then either type your answer
+in the reply field and press Enter (it is sent into the conversation as
+`About "<topic>": <your answer>` and the topic is settled), press **discuss**
+to have Claude lay out the context and its recommendation for that topic, or
+press **done** to settle it without a reply.
+
+Topics come from two places. A question dialog (AskUserQuestion) is a topic
+for as long as it is open. After every reply, a small model call (Haiku) reads
+the reply and lists the asks in it that are still waiting on you, and marks
+the open ones your last message or the reply settled. `/topics add <text>`
+notes a topic by hand.
 
 The pane opens by itself in a fullscreen terminal wide enough for a sidebar
 (110 columns or more). `/topics` opens or focuses it anywhere; `/topics clear`
-forgets every record. The status line shows how many other topics are waiting,
-and a toast appears when another session starts waiting for you.
+forgets every topic. The status line counts the open ones, and a toast appears
+when a reply raises new ones. Topics are kept per session, so
+`claude --resume` brings them back.
 
 ## Install
 
@@ -27,28 +33,24 @@ At the prompt of a terminal Claude Code session:
 /plugin install sidebar-topics --marketplace qmw/claude-sidebar-topics
 ```
 
-Answer `y` to add the marketplace, then pick a scope (user scope installs it for
-every session). From a shell the same line is `claude plugin install
-sidebar-topics --marketplace qmw/claude-sidebar-topics`. Every session that
-should appear in the sidebar needs the mod loaded, so install it at the user
-scope.
+Answer `y` to add the marketplace, then pick a scope. The user scope, the
+default, installs it once for every session you start afterwards. From a shell
+the same install is:
+
+```
+claude plugin install sidebar-topics --marketplace qmw/claude-sidebar-topics --scope user
+```
 
 To run it from a checkout instead: `claude --plugin-dir <path to this folder>`.
 
-## How it works
+## Cost
 
-Each session running the mod keeps one record in the mod's own store (a JSON
-file under your Claude Code configuration directory, shared by all your
-sessions): the session id, its directory, the first prompt as the topic title,
-its status, and the last question or the tail of the last answer. The record is
-updated on turn start, turn end, question dialogs and permission prompts,
-refreshed by a heartbeat, removed when the session ends, and dropped by any
-session that finds it stale (no heartbeat for 90 seconds). The pane polls the
-store every two seconds.
+One Haiku call per reply, with the reply and your last message as its input.
 
 ## Files
 
 - `.claude-plugin/plugin.json`: the manifest
 - `.claude-plugin/marketplace.json`: makes this repository installable
 - `hooks/hooks.json`, `hooks/register.tsx`: the hooks module
-- `types/index.d.ts`: the record type and the mod's state contract
+- `hooks/register.test.tsx`: tests, run with `claude plugin test .`
+- `types/index.d.ts`: the topic type and the mod's state contract
