@@ -1,6 +1,6 @@
 {
   "name": "sidebar-topics",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A sidebar pane listing the points in this conversation on which Claude waits for you: questions, go-aheads, decisions. Click one to answer or discuss it.",
   "author": { "name": "Piotr Sobolewski" },
   "license": "MIT",
