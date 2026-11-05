@@ -189,17 +189,27 @@ export const register: Register = on => {
     }
   })
 
+  // The topic is what the person typed: the first prompt from the composer
+  // (or a remote client) names it, and a reply sent from the pane is noted
+  // as such. Prompts the engine or another plugin submits are not topics.
+  on('prompt.submit', async ($, e, next) => {
+    if (e.isMeta || e.command) return next(e)
+    const line = firstLine(e.text)
+    if (line.length === 0) return next(e)
+    const kind = e.origin.kind
+    if (kind === 'composer' || kind === 'bridge' || kind === 'sdk') {
+      const prev = await own($)
+      await mark($, { title: prev?.title || fit(line, 80), detail: `You: ${tail(line, 240)}` })
+    } else if (kind === 'plugin' && e.origin.name === 'sidebar-topics') {
+      await mark($, { detail: `You (from the pane): ${tail(line, 240)}` })
+    }
+
+    return next(e)
+  })
+
   on('turn.start', async ($, e, next) => {
     if (e.agentId !== undefined) return next(e)
-    const prev = await own($)
-    // A system envelope (a task notification, a hook's note) is not a topic.
-    const line = e.text.trimStart().startsWith('<') ? '' : firstLine(e.text)
-    const kept = prev?.title && !prev.title.startsWith('<') ? prev.title : ''
-    await mark($, {
-      status: 'working',
-      title: kept || fit(line, 80),
-      detail: line ? `You: ${tail(line, 240)}` : prev?.detail ?? '',
-    })
+    await mark($, { status: 'working' })
 
     return next(e)
   })
