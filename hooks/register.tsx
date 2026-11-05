@@ -1,18 +1,25 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Topic, TopicKind, TopicRecord } from '../types'
+import type { Peer, Topic, TopicKind, TopicRecord } from '../types'
 
 const PANE = 'topics'
 const TITLE = 'Topics'
 const KEY = 'topics:'
 const KEEP_MS = 30 * 24 * 60 * 60 * 1000
+const POLL_MS = 3_000
+const BEAT_MS = 20_000
+// A session that has not refreshed its record for this long is not shown.
+const STALE_MS = 90_000
 const READER_MODEL = 'haiku'
 
 // Change the tag when a topic's fields change: it declines what an earlier
 // version stored, which outlives a reload.
 const topics = atom({ plugin: 'sidebar-topics', key: 'topics' } as const, [], {
   shape: 'topics-2',
+})
+const others = atom({ plugin: 'sidebar-topics', key: 'others' } as const, [], {
+  shape: 'others-1',
 })
 const selected = atom({ plugin: 'sidebar-topics', key: 'selected' } as const, '')
 const sent = atom({ plugin: 'sidebar-topics', key: 'sent' } as const, 0)
@@ -47,6 +54,8 @@ const age = (ms: number) => {
   return h < 48 ? `${h}h` : `${Math.round(h / 24)}d`
 }
 
+const base = (path: string) => path.split('/').filter(Boolean).pop() ?? path
+
 const glyph = (kind: TopicKind) => (kind === 'question' ? '?' : kind === 'go' ? '!' : '•')
 
 const tint = (kind: TopicKind) => (kind === 'go' ? 'yellow' : kind === 'question' ? 'cyan' : 'green')
@@ -58,10 +67,23 @@ const newId = () => `${Date.now().toString(36)}-${Math.random().toString(36).sli
 
 const sameTitle = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase()
 
-/** Writes the list to the store, so `claude --resume` brings it back. */
-async function save($: EngineInterface, list: Topic[]) {
-  const record: TopicRecord = { savedAt: await $.clock.now(), topics: list }
-  await $.store.set(KEY + (await $.session.id()), record)
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
+
+const isTopic = (t: unknown): t is Topic =>
+  !!t && typeof t === 'object' && typeof (t as Topic).id === 'string' && typeof (t as Topic).title === 'string'
+
+/** Writes this session's record to the store: the list, and a heartbeat. */
+async function save($: EngineInterface, list: Topic[], seenAt?: number) {
+  const now = await $.clock.now()
+  const sessionId = await $.session.id()
+  const record: TopicRecord = {
+    sessionId,
+    cwd: await $.session.cwd(),
+    savedAt: now,
+    seenAt: seenAt ?? now,
+    topics: list,
+  }
+  await $.store.set(KEY + sessionId, record)
 }
 
 /** Reads this session's list from the store; drops other sessions' old ones. */
@@ -72,9 +94,9 @@ async function load($: EngineInterface): Promise<Topic[]> {
   for (const key of await $.store.keys()) {
     if (!key.startsWith(KEY)) continue
     const record = (await $.store.get(key)) as Partial<TopicRecord> | undefined
-    const list = Array.isArray(record?.topics) ? record.topics : []
+    const list = Array.isArray(record?.topics) ? record.topics.filter(isTopic) : []
     if (key === mine) {
-      found = list.filter(t => t && typeof t.id === 'string' && typeof t.title === 'string')
+      found = list
     } else if (typeof record?.savedAt !== 'number' || now - record.savedAt > KEEP_MS) {
       await $.store.delete(key)
     }
@@ -82,13 +104,49 @@ async function load($: EngineInterface): Promise<Topic[]> {
   return found
 }
 
-/** Changes the list, keeps it, and refreshes the status line. */
+function status($: EngineInterface, mine: Topic[], peers: Peer[]) {
+  const here = mine.filter(t => t.isOpen).length
+  const elsewhere = peers.reduce((n, p) => n + p.topics.length, 0)
+  const parts = [here > 0 ? `${here} here` : '', elsewhere > 0 ? `${elsewhere} elsewhere` : ''].filter(Boolean)
+  $.ui.status(parts.length > 0 ? `topics: ${parts.join(' · ')}` : undefined)
+}
+
+/** Changes this session's list, keeps it, and refreshes the status line. */
 async function change($: EngineInterface, fn: (list: Topic[]) => Topic[]) {
   const list = await update($, topics, fn)
   await save($, list)
-  const open = list.filter(t => t.isOpen).length
-  $.ui.status(open > 0 ? `${open} topic${open === 1 ? '' : 's'} await${open === 1 ? 's' : ''} you` : undefined)
+  status($, list, await read($, others))
   return list
+}
+
+/** Reads the other live sessions' open topics from the store into the pane. */
+async function poll($: EngineInterface) {
+  const mine = await $.session.id()
+  const now = await $.clock.now()
+  const peers: Peer[] = []
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(KEY) || key === KEY + mine) continue
+    const record = (await $.store.get(key)) as Partial<TopicRecord> | undefined
+    if (!record || typeof record.seenAt !== 'number' || now - record.seenAt > STALE_MS) continue
+    const open = (Array.isArray(record.topics) ? record.topics.filter(isTopic) : []).filter(t => t.isOpen)
+    if (open.length === 0) continue
+    peers.push({
+      sessionId: record.sessionId ?? key.slice(KEY.length),
+      cwd: record.cwd ?? '',
+      topics: open.sort((a, b) => b.createdAt - a.createdAt),
+    })
+  }
+  peers.sort((a, b) => (b.topics[0]?.createdAt ?? 0) - (a.topics[0]?.createdAt ?? 0))
+  const before = await read($, others)
+  if (JSON.stringify(before) === JSON.stringify(peers)) return
+  const known = new Set(before.flatMap(p => p.topics.map(t => t.id)))
+  const fresh = peers.flatMap(p => p.topics.filter(t => !known.has(t.id)).map(t => ({ peer: p, topic: t })))
+  if (fresh.length > 0 && before.length + known.size > 0) {
+    const first = fresh[0]
+    if (first) $.ui.toast(`${base(first.peer.cwd)}: ${glyph(first.topic.kind)} ${fit(first.topic.title, 60)}`)
+  }
+  await update($, others, () => peers)
+  status($, await read($, topics), peers)
 }
 
 async function add($: EngineInterface, items: { title: string; detail: string; kind: TopicKind; id?: string }[]) {
@@ -119,6 +177,11 @@ async function settle($: EngineInterface, ids: readonly string[]) {
   await change($, list =>
     list.map(t => (t.isOpen && set.has(t.id) ? { ...t, isOpen: false, resolvedAt: now } : t)),
   )
+}
+
+async function settleByTitle($: EngineInterface, title: string) {
+  const ids = (await read($, topics)).filter(t => t.isOpen && sameTitle(t.title, title)).map(t => t.id)
+  await settle($, ids)
 }
 
 const READER_SYSTEM = `You read one reply an AI coding assistant wrote to its user, and you list the points on which the assistant is now waiting for the user: a question it asks the user, a decision it leaves to the user, a go-ahead it asks for before doing something, or information it needs from the user. Rhetorical questions, questions the assistant answers itself, and offers the user has no reason to act on ("let me know if you want more") are not such points. Also say which of the already open topics the user's last message or this reply has settled: answered, decided, done, or no longer asked.
@@ -186,7 +249,7 @@ async function readReply($: EngineInterface, answer: string, prompt: string) {
     const before = (await read($, topics)).length
     const after = (await add($, reading.new)).length
     const added = after - before
-    if (added > 0) $.ui.toast(`${added} topic${added === 1 ? '' : 's'} await${added === 1 ? 's' : ''} you`)
+    if (added > 0) $.ui.toast(`${plural(added, 'topic')} await${added === 1 ? 's' : ''} you`)
   } catch (error) {
     $.ui.log(`sidebar-topics: reading the reply failed: ${String(error)}`, { to: 'debug' })
   } finally {
@@ -194,21 +257,56 @@ async function readReply($: EngineInterface, answer: string, prompt: string) {
   }
 }
 
-/** Sends your answer to a topic into the conversation and settles the topic. */
-async function answer($: EngineInterface, topic: Topic, text: string) {
-  const body = text.trim()
-  if (body.length === 0) return
-  void $.prompt.submit({ text: `About "${topic.title}": ${body}` })
-  await settle($, [topic.id])
-  await update($, sent, n => n + 1)
-  await update($, notice, () => `Answered "${fit(topic.title, 40)}".`)
+/** Where a picked topic lives: this session, or a peer. */
+type Found = { topic: Topic; peer?: Peer }
+
+async function find($: EngineInterface, id: string): Promise<Found | undefined> {
+  const mine = (await read($, topics)).find(t => t.id === id)
+  if (mine) return { topic: mine }
+  for (const peer of await read($, others)) {
+    const topic = peer.topics.find(t => t.id === id)
+    if (topic) return { topic, peer }
+  }
+  return undefined
 }
 
-async function discuss($: EngineInterface, topic: Topic) {
-  void $.prompt.submit({
-    text: `Let's discuss the open topic "${topic.title}": ${topic.detail}\nGive me the context and your recommendation, then wait for my answer.`,
-  })
-  await update($, notice, () => `Asked to discuss "${fit(topic.title, 40)}".`)
+/** Sends text into the topic's session: this one's prompt, or a peer message. */
+async function deliver($: EngineInterface, found: Found, text: string): Promise<string> {
+  if (!found.peer) {
+    void $.prompt.submit({ text })
+    return 'this session'
+  }
+  const result = await $.session.send({ to: { sessionId: found.peer.sessionId }, text })
+  if (!result.isDelivered) throw new Error(result.reason)
+  return base(found.peer.cwd)
+}
+
+/** Your answer to a topic, sent into its session; a topic of this session is settled. */
+async function answer($: EngineInterface, found: Found, text: string) {
+  const body = text.trim()
+  if (body.length === 0) return
+  try {
+    const where = await deliver($, found, `About "${found.topic.title}": ${body}`)
+    if (!found.peer) await settle($, [found.topic.id])
+    await update($, notice, () => `Answered in ${where}.`)
+  } catch (error) {
+    await update($, notice, () => `Not delivered: ${String(error)}`)
+  }
+  await update($, sent, n => n + 1)
+}
+
+async function discuss($: EngineInterface, found: Found) {
+  const { topic } = found
+  try {
+    const where = await deliver(
+      $,
+      found,
+      `Let's discuss the open topic "${topic.title}": ${topic.detail}\nGive me the context and your recommendation, then wait for my answer.`,
+    )
+    await update($, notice, () => `Asked ${where} to discuss it.`)
+  } catch (error) {
+    await update($, notice, () => `Not delivered: ${String(error)}`)
+  }
 }
 
 export const register: Register = on => {
@@ -219,7 +317,18 @@ export const register: Register = on => {
     })
     const stored = await load($)
     await change($, list => (list.length > 0 ? list : stored))
+    await poll($)
     if (e.isInteractive) void $.ui.open({ id: PANE, title: TITLE })
+    $.clock.every(POLL_MS, () => poll($))
+    $.clock.every(BEAT_MS, async () => save($, await read($, topics)))
+
+    return next(e)
+  })
+
+  on('session.end', async ($, e, next) => {
+    // Keep the list for a resume, but stop showing this session to the others.
+    await save($, await read($, topics), 0)
+    $.ui.status(undefined)
 
     return next(e)
   })
@@ -251,6 +360,17 @@ export const register: Register = on => {
     const kind = e.origin.kind
     const mine = kind === 'plugin' && e.origin.name === 'sidebar-topics'
     if (kind === 'composer' || kind === 'bridge' || kind === 'sdk' || mine) {
+      await update($, lastPrompt, () => e.text)
+    }
+
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // An answer sent from another session's pane settles the topic it names.
+  on('session.receive', async ($, e, next) => {
+    if (e.agentId === undefined && (e.origin.kind === 'peer' || e.origin.kind === 'peer-send-message')) {
+      const named = /^About "([^"]+)": /.exec(e.text)
+      if (named?.[1]) await settleByTitle($, named[1])
       await update($, lastPrompt, () => e.text)
     }
 
@@ -293,6 +413,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
     const list = await read($, topics)
+    const peers = await read($, others)
     const picked = await read($, selected)
     const count = await read($, sent)
     const line = await read($, notice)
@@ -301,7 +422,8 @@ export const register: Register = on => {
     const width = e.props.bodyColumns
     const open = list.filter(t => t.isOpen).sort((a, b) => b.createdAt - a.createdAt)
     const done = list.filter(t => !t.isOpen)
-    const chosen = list.find(t => t.id === picked)
+    const chosen = await find($, picked)
+    const elsewhere = peers.reduce((n, p) => n + p.topics.length, 0)
 
     const row = (t: Topic) => {
       const when = age(now - t.createdAt)
@@ -318,22 +440,36 @@ export const register: Register = on => {
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="column">
           <Text weight="bold">
-            Awaiting you <Text dimColor>({open.length})</Text>
+            This session <Text dimColor>({open.length})</Text>
           </Text>
-          {open.length === 0 && <Text dimColor>Nothing waits for you.</Text>}
+          {open.length === 0 && <Text dimColor>Nothing waits for you here.</Text>}
           {open.map(row)}
           {reading && <Text dimColor>Reading the last reply…</Text>}
         </Box>
+        <Box flexDirection="column">
+          <Text weight="bold">
+            Other sessions <Text dimColor>({elsewhere})</Text>
+          </Text>
+          {peers.length === 0 && <Text dimColor>No other session waits for you.</Text>}
+          {peers.map(peer => (
+            <Box key={`peer:${peer.sessionId}`} flexDirection="column">
+              <Text dimColor>{fit(base(peer.cwd) || peer.sessionId, width)}</Text>
+              {peer.topics.map(row)}
+            </Box>
+          ))}
+        </Box>
         {chosen && (
           <Box flexDirection="column" borderStyle="round" paddingX={1}>
-            <Text weight="bold">{fit(chosen.title, width - 4)}</Text>
+            <Text weight="bold">{fit(chosen.topic.title, width - 4)}</Text>
             <Text dimColor>
-              {label(chosen.kind)} · {age(now - chosen.createdAt)} ago{chosen.isOpen ? '' : ' · settled'}
+              {chosen.peer ? `${base(chosen.peer.cwd)} · ` : ''}
+              {label(chosen.topic.kind)} · {age(now - chosen.topic.createdAt)} ago
+              {chosen.topic.isOpen ? '' : ' · settled'}
             </Text>
-            {chosen.detail.length > 0 && <Text wrap="wrap">{chosen.detail}</Text>}
+            {chosen.topic.detail.length > 0 && <Text wrap="wrap">{chosen.topic.detail}</Text>}
             <Input
-              key={`reply:${chosen.id}:${count}`}
-              placeholder="Your answer, Enter sends it"
+              key={`reply:${chosen.topic.id}:${count}`}
+              placeholder={chosen.peer ? 'Your answer, Enter sends it to that session' : 'Your answer, Enter sends it'}
               submitLabel="send"
               rows={2}
               onSubmit={value => void answer($, chosen, value)}
@@ -343,9 +479,21 @@ export const register: Register = on => {
               <Button key="discuss" plain onPress={() => void discuss($, chosen)}>
                 discuss
               </Button>
-              {chosen.isOpen && (
-                <Button key="done" plain dimColor onPress={() => void settle($, [chosen.id])}>
+              {!chosen.peer && chosen.topic.isOpen && (
+                <Button key="done" plain dimColor onPress={() => void settle($, [chosen.topic.id])}>
                   done
+                </Button>
+              )}
+              {chosen.peer && (
+                <Button
+                  key="copy-resume"
+                  plain
+                  dimColor
+                  onPress={press =>
+                    void $.ui.copy({ text: `claude --resume ${chosen.peer?.sessionId ?? ''}`, surface: press.surface })
+                  }
+                >
+                  copy resume command
                 </Button>
               )}
               <Button key="close-detail" plain dimColor onPress={() => update($, selected, () => '')}>

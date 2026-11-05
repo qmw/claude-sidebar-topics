@@ -6,7 +6,7 @@
  */
 export type TopicKind = 'question' | 'go' | 'input'
 
-/** One point in this conversation on which the assistant waits for you. */
+/** One point in a conversation on which the assistant waits for you. */
 export type Topic = {
   id: string
   /** One short line naming the topic. */
@@ -24,7 +24,19 @@ export type Topic = {
 
 /** What the store keeps per session, under `topics:<session id>`. */
 export type TopicRecord = {
+  sessionId: string
+  /** The directory the session runs in. */
+  cwd: string
   savedAt: number
+  /** The last heartbeat; 0 once the session ended. A record not refreshed for a while is not shown. */
+  seenAt: number
+  topics: Topic[]
+}
+
+/** Another live session and its open topics, as the pane shows them. */
+export type Peer = {
+  sessionId: string
+  cwd: string
   topics: Topic[]
 }
 
@@ -33,6 +45,8 @@ declare module 'claude-code' {
     'sidebar-topics': {
       /** Every topic of this conversation, open and settled. */
       topics: Shaped<Topic[]>
+      /** The other live sessions' open topics, as last read from the store. */
+      others: Shaped<Peer[]>
       /** The topic id picked in the pane; '' for none. */
       selected: string
       /** How many replies went out from the pane; bumps the reply field's key. */

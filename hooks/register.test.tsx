@@ -10,7 +10,7 @@ const PANE = {
     isFocused: false,
     bodyColumns: 60,
     placement: 'dock',
-    scroll: { offset: 0, bodyRows: 30 },
+    scroll: { offset: 0, bodyRows: 40 },
     view: {},
   },
 } as const
@@ -26,9 +26,19 @@ const open = {
   createdAt: NOW - 120_000,
 }
 
-function engine(on: On, prompts: string[]) {
+const peerTopic = {
+  id: 'deploy',
+  title: 'Deploy to staging now?',
+  detail: 'The build is green; say go and I deploy to staging.',
+  kind: 'go',
+  isOpen: true,
+  createdAt: NOW - 30_000,
+}
+
+function engine(on: On, prompts: string[], sends: { to: string; text: string }[] = []) {
   mock.clock(on, { now: NOW })
   on('session.id', () => ({ value: 'this-session' }))
+  on('session.cwd', () => ({ value: '/home/me/here' }))
   on('command.register', () => ({ value: { command: 'topics' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.status', () => ({ value: undefined }))
@@ -39,12 +49,19 @@ function engine(on: On, prompts: string[]) {
 
     return { text: e.text }
   })
+  on('session.send', (_, e) => {
+    sends.push({ to: e.to, text: e.text })
+
+    return { isDelivered: true as const }
+  })
 }
 
 test('a stored open topic is listed, answered from the pane, and settled', async ($, on) => {
   const prompts: string[] = []
   engine(on, prompts)
-  mock.store(on, { 'topics:this-session': { savedAt: NOW - 60_000, topics: [open] } })
+  mock.store(on, {
+    'topics:this-session': { sessionId: 'this-session', cwd: '/home/me/here', savedAt: NOW - 60_000, seenAt: NOW - 60_000, topics: [open] },
+  })
 
   await $.session.start({ cwd: '/home/me/here', surface: 'terminal', isInteractive: true })
 
@@ -65,6 +82,33 @@ test('a stored open topic is listed, answered from the pane, and settled', async
   // Answered: it leaves the open list and the settled count appears.
   expect(await ui.find({ key: 't:db' })).toBeUndefined()
   expect((await ui.find({ key: 'clear-done' }))?.text).toContain('1 settled')
+  await ui.unmount()
+})
+
+test("another live session's open topic is listed below and answered by message", async ($, on) => {
+  const prompts: string[] = []
+  const sends: { to: string; text: string }[] = []
+  engine(on, prompts, sends)
+  mock.store(on, {
+    'topics:peer-session': { sessionId: 'peer-session', cwd: '/home/me/shop', savedAt: NOW - 5_000, seenAt: NOW - 5_000, topics: [peerTopic] },
+    'topics:gone-session': { sessionId: 'gone-session', cwd: '/home/me/old', savedAt: NOW - 5_000, seenAt: NOW - 600_000, topics: [{ ...peerTopic, id: 'stale' }] },
+  })
+
+  await $.session.start({ cwd: '/home/me/here', surface: 'terminal', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Nothing waits for you here/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^shop$/ })).toBeDefined()
+  expect((await ui.find({ key: 't:deploy' }))?.text).toContain('Deploy to staging')
+  // A session not heard from is not shown.
+  expect(await ui.find({ key: 't:stale' })).toBeUndefined()
+
+  await ui.press({ key: 't:deploy' })
+  expect(await ui.find({ type: 'Text', text: /build is green/ })).toBeDefined()
+  await ui.input({ key: 'reply:deploy:0', text: 'Go.' })
+  expect(sends.at(-1)?.text).toBe('About "Deploy to staging now?": Go.')
+  expect(prompts).toHaveLength(0)
+  expect(await ui.find({ type: 'Text', text: /Answered in shop/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -102,6 +146,6 @@ test('a value an earlier version stored is declined', async ($, on) => {
   mock.clock(on, { now: NOW })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /Nothing waits/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Nothing waits for you here/ })).toBeDefined()
   await ui.unmount()
 })
