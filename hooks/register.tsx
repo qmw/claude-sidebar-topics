@@ -192,10 +192,12 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     if (e.agentId !== undefined) return next(e)
     const prev = await own($)
-    const line = firstLine(e.text)
+    // A system envelope (a task notification, a hook's note) is not a topic.
+    const line = e.text.trimStart().startsWith('<') ? '' : firstLine(e.text)
+    const kept = prev?.title && !prev.title.startsWith('<') ? prev.title : ''
     await mark($, {
       status: 'working',
-      title: prev?.title || fit(line, 80),
+      title: kept || fit(line, 80),
       detail: line ? `You: ${tail(line, 240)}` : prev?.detail ?? '',
     })
 
